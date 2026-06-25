@@ -9,10 +9,11 @@ Runs every 2 days via Railway Cron Job.
 
 import os
 import re
+import ssl
 import logging
 from difflib import SequenceMatcher
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+import pg8000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,25 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+
+def get_connection():
+    """Parse DATABASE_URL and return a pg8000 connection."""
+    url = urlparse(DATABASE_URL)
+    return pg8000.connect(
+        host=url.hostname,
+        port=url.port or 5432,
+        database=url.path.lstrip('/'),
+        user=url.username,
+        password=url.password,
+        ssl_context=ssl.create_default_context(),
+    )
+
+
+def rows_as_dicts(cursor):
+    """Convert pg8000 cursor rows (tuples) into list of dicts."""
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 # ---------------------------------------------------------------------------
 # Text helpers
@@ -255,13 +275,13 @@ def is_true_duplicate(pending: dict, approved: dict) -> bool:
 def main():
     log.info("=== UNN Marketplace Auto-Cleaner starting ===")
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_connection()
     conn.autocommit = False
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur = conn.cursor()
 
     # 1. Load all listings
     cur.execute("SELECT * FROM listings")
-    all_rows = [dict(r) for r in cur.fetchall()]
+    all_rows = rows_as_dicts(cur)
     log.info(f"Loaded {len(all_rows)} listings from database")
 
     approved_rows = [r for r in all_rows if r['status'] in ('approved', 'sold')]
@@ -302,9 +322,11 @@ def main():
 
     # 3. Delete duplicates
     if deleted_ids:
+        # pg8000 doesn't support ANY with list — use IN with placeholders
+        placeholders = ', '.join(['%s'] * len(deleted_ids))
         cur.execute(
-            "DELETE FROM listings WHERE id = ANY(%s)",
-            (deleted_ids,)
+            f"DELETE FROM listings WHERE id::text IN ({placeholders})",
+            [str(i) for i in deleted_ids]
         )
         log.info(f"Deleted {len(deleted_ids)} duplicate listings")
     else:
